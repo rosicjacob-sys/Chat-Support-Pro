@@ -447,13 +447,21 @@ router.post('/uploads/parse', authenticateToken, upload.single('file'), async (r
       if (!r.newDomain) continue;
       const key = `${r.sourceDomain}::${r.newDomain}`;
       if (!pairMap.has(key)) {
-        const matchedStore = storeByDomain.get(r.sourceDomain.toLowerCase());
+        const matchedStore  = storeByDomain.get(r.sourceDomain.toLowerCase());
+        // The new domain might already belong to a different store — the
+        // rename would collide with stores.shop_domain's unique constraint.
+        // Surface that here, at preview time, instead of only after Apply
+        // fails with a raw Postgres error.
+        const conflictStore = storeByDomain.get(r.newDomain.toLowerCase());
+        const hasConflict   = conflictStore && conflictStore.id !== matchedStore?.id;
         pairMap.set(key, {
-          sourceDomain:    r.sourceDomain,
-          newDomain:       r.newDomain,
+          sourceDomain:     r.sourceDomain,
+          newDomain:        r.newDomain,
           matchedStoreId:   matchedStore?.id ?? null,
           matchedStoreName: matchedStore?.brand_name ?? null,
-          customerCount:   0,
+          conflictStoreId:   hasConflict ? conflictStore.id : null,
+          conflictStoreName: hasConflict ? conflictStore.brand_name : null,
+          customerCount:    0,
         });
       }
       pairMap.get(key).customerCount++;

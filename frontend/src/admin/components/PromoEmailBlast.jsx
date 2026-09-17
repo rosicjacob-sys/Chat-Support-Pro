@@ -564,7 +564,7 @@ export default function PromoEmailBlast({ onBack }) {
       setUploadInvalidRows(res?.invalidRows || []);
       setUploadFlagged(res?.flaggedDuplicates || []);
       setDomainPairs(res?.domainPairs || []);
-      setCheckedPairs(new Set((res?.domainPairs || []).filter((p) => p.matchedStoreId).map((p) => p.sourceDomain)));
+      setCheckedPairs(new Set((res?.domainPairs || []).filter((p) => p.matchedStoreId && !p.conflictStoreId).map((p) => p.sourceDomain)));
     } catch (err) {
       console.error('[Promo] Upload failed:', err);
       setError(err?.message || 'Failed to parse the uploaded file.');
@@ -1087,6 +1087,9 @@ export default function PromoEmailBlast({ onBack }) {
                     <span className="peb-check-name">
                       {p.sourceDomain} → {p.newDomain}
                       {!p.matchedStoreId && <span className="peb-warn"> (no matching store on file)</span>}
+                      {p.conflictStoreId && (
+                        <span className="peb-warn"> ({p.newDomain} already belongs to "{p.conflictStoreName}" — resolve before applying)</span>
+                      )}
                     </span>
                     <span className="peb-check-domain">{p.customerCount} customer{p.customerCount === 1 ? '' : 's'}</span>
                   </label>
