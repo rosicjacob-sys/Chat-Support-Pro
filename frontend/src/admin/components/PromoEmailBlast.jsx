@@ -418,6 +418,37 @@ export default function PromoEmailBlast({ onBack }) {
   const [results,  setResults]  = useState(null);
   const cancelRef = useRef(false);
 
+  // Delivery: send immediately, or hand off to the backend campaign scheduler
+  const [deliveryMode,   setDeliveryMode]   = useState('now'); // 'now' | 'schedule'
+  const [campaignName,   setCampaignName]   = useState('');
+  const [batchSize,      setBatchSize]      = useState(100);
+  const [intervalHours,  setIntervalHours]  = useState(2);
+  const [startAt,        setStartAt]        = useState(() => {
+    const d = new Date(Date.now() + 10 * 60 * 1000);
+    d.setSeconds(0, 0);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  });
+  const [timezone,       setTimezone]       = useState('America/New_York');
+  const [scheduling,     setScheduling]     = useState(false);
+  const [scheduleResult, setScheduleResult] = useState(null);
+
+  // Campaigns list (backend-driven scheduled sends)
+  const [campaigns,        setCampaigns]        = useState([]);
+  const [campaignsLoading, setCampaignsLoading]  = useState(false);
+  const [campaignActionId, setCampaignActionId]  = useState(null);
+
+  const refreshCampaigns = useCallback(async () => {
+    setCampaignsLoading(true);
+    try {
+      setCampaigns(await api.getPromoCampaigns() || []);
+    } catch (err) {
+      console.error('[Promo] Failed to load campaigns:', err);
+    } finally {
+      setCampaignsLoading(false);
+    }
+  }, []);
+
   // ── Bootstrap ───────────────────────────────────────────────────────────────
   const refreshCapStatus = useCallback(async () => {
     setCapLoading(true);
@@ -433,6 +464,7 @@ export default function PromoEmailBlast({ onBack }) {
   }, []);
 
   useEffect(() => { refreshCapStatus(); }, [refreshCapStatus]);
+  useEffect(() => { refreshCampaigns(); }, [refreshCampaigns]);
 
   // Load stores on mount
   useEffect(() => {
@@ -875,6 +907,48 @@ export default function PromoEmailBlast({ onBack }) {
 
   const cancelSend = () => { cancelRef.current = true; };
 
+  // ── Schedule a campaign — backend takes it from here ────────────────────────
+  const startSchedule = async () => {
+    setConfirmOpen(false);
+    if (selected.length === 0) return;
+
+    setScheduling(true);
+    setScheduleResult(null);
+    try {
+      const payload = {
+        ...basePayload(),
+        name:          campaignName.trim() || `Promo ${new Date().toLocaleDateString()}`,
+        recipients:    selected.map(toPayloadRecipient),
+        batchSize,
+        intervalHours,
+        startAt,
+        timezone,
+      };
+      const campaign = await api.createPromoCampaign(payload);
+      setScheduleResult({ ok: true, campaign });
+      setTab('campaigns');
+      refreshCampaigns();
+    } catch (err) {
+      setScheduleResult({ ok: false, error: err?.message || 'Failed to schedule campaign.' });
+    } finally {
+      setScheduling(false);
+    }
+  };
+
+  const runCampaignAction = async (id, action) => {
+    setCampaignActionId(id);
+    try {
+      if (action === 'pause')  await api.pausePromoCampaign(id);
+      if (action === 'resume') await api.resumePromoCampaign(id);
+      if (action === 'cancel') await api.cancelPromoCampaign(id);
+      await refreshCampaigns();
+    } catch (err) {
+      setError(err?.message || `Failed to ${action} campaign.`);
+    } finally {
+      setCampaignActionId(null);
+    }
+  };
+
   const allFilteredSelected =
     filtered.length > 0 && filtered.every((r) => !excludedEmails.has(r.email));
 
@@ -1153,6 +1227,55 @@ export default function PromoEmailBlast({ onBack }) {
               has moved (see the recipient/store data's <code>movedToDomain</code> field).
             </div>
           </div>
+
+          {/* Delivery: now vs scheduled */}
+          <div className="peb-section">
+            <h3>4. Delivery</h3>
+            <label className="peb-radio">
+              <input type="radio" checked={deliveryMode === 'now'} onChange={() => setDeliveryMode('now')} />
+              <span>Send now</span>
+            </label>
+            <label className="peb-radio">
+              <input type="radio" checked={deliveryMode === 'schedule'} onChange={() => setDeliveryMode('schedule')} />
+              <span>Schedule</span>
+            </label>
+
+            {deliveryMode === 'schedule' && (
+              <div className="peb-mt8">
+                <label className="peb-field">
+                  <span>Campaign name</span>
+                  <input value={campaignName} onChange={(e) => setCampaignName(e.target.value)} type="text" placeholder="Promo campaign" />
+                </label>
+                <div className="peb-row2">
+                  <label className="peb-field">
+                    <span>Batch size</span>
+                    <input value={batchSize} onChange={(e) => setBatchSize(Number(e.target.value) || 1)} type="number" min="1" />
+                  </label>
+                  <label className="peb-field">
+                    <span>Every (hours)</span>
+                    <input value={intervalHours} onChange={(e) => setIntervalHours(Number(e.target.value) || 1)} type="number" min="1" step="0.5" />
+                  </label>
+                </div>
+                <label className="peb-field">
+                  <span>Start</span>
+                  <input value={startAt} onChange={(e) => setStartAt(e.target.value)} type="datetime-local" />
+                </label>
+                <label className="peb-field">
+                  <span>Timezone</span>
+                  <select value={timezone} onChange={(e) => setTimezone(e.target.value)}>
+                    <option value="America/New_York">Eastern (EST/EDT)</option>
+                    <option value="UTC">UTC</option>
+                    <option value="Asia/Manila">Philippines (PH)</option>
+                  </select>
+                </label>
+                <div className="peb-muted">
+                  Sends {batchSize} recipients every {intervalHours} hour{Number(intervalHours) === 1 ? '' : 's'},
+                  starting at the time above, until the list is done. Runs on the server — this
+                  page doesn't need to stay open. Still subject to the daily cap.
+                </div>
+              </div>
+            )}
+          </div>
         </aside>
 
         {/* ── Right: tabs ── */}
@@ -1166,6 +1289,9 @@ export default function PromoEmailBlast({ onBack }) {
             </button>
             <button className={`peb-tab ${tab === 'preview' ? 'is-active' : ''}`} onClick={() => setTab('preview')} type="button">
               Preview
+            </button>
+            <button className={`peb-tab ${tab === 'campaigns' ? 'is-active' : ''}`} onClick={() => { setTab('campaigns'); refreshCampaigns(); }} type="button">
+              Campaigns {campaigns.length > 0 ? `(${campaigns.length})` : ''}
             </button>
           </div>
 
@@ -1310,6 +1436,59 @@ export default function PromoEmailBlast({ onBack }) {
               <iframe className="peb-iframe" title="Email preview" srcDoc={previewHtml} />
             </div>
           )}
+
+          {/* Campaigns tab */}
+          {tab === 'campaigns' && (
+            <div className="peb-tabpane">
+              {campaignsLoading ? (
+                <div className="peb-empty"><p>Loading campaigns…</p></div>
+              ) : campaigns.length === 0 ? (
+                <div className="peb-empty">
+                  <p>No campaigns yet.</p>
+                  <p className="peb-muted">Switch Delivery to "Schedule" on the left to create one.</p>
+                </div>
+              ) : (
+                <div className="peb-campaign-list">
+                  {campaigns.map((c) => {
+                    const progressPct = c.totalRecipients
+                      ? Math.round(((c.sentCount + c.failedCount + c.skippedCount) / c.totalRecipients) * 100)
+                      : 0;
+                    return (
+                      <div key={c.id} className="peb-campaign-card">
+                        <div className="peb-campaign-head">
+                          <div>
+                            <strong>{c.name}</strong>
+                            <span className={`peb-campaign-status peb-campaign-status--${c.status}`}>{c.status}</span>
+                          </div>
+                          <div className="peb-campaign-actions">
+                            {(c.status === 'scheduled' || c.status === 'running') && (
+                              <button className="peb-btn peb-btn--ghost peb-btn--sm" disabled={campaignActionId === c.id} onClick={() => runCampaignAction(c.id, 'pause')} type="button">Pause</button>
+                            )}
+                            {c.status === 'paused' && (
+                              <button className="peb-btn peb-btn--ghost peb-btn--sm" disabled={campaignActionId === c.id} onClick={() => runCampaignAction(c.id, 'resume')} type="button">Resume</button>
+                            )}
+                            {['scheduled', 'running', 'paused'].includes(c.status) && (
+                              <button className="peb-btn peb-btn--ghost peb-btn--sm" disabled={campaignActionId === c.id} onClick={() => runCampaignAction(c.id, 'cancel')} type="button">Cancel</button>
+                            )}
+                          </div>
+                        </div>
+                        <div className="peb-progress">
+                          <div className="peb-progress-bar" style={{ width: `${progressPct}%` }} />
+                        </div>
+                        <div className="peb-muted peb-mt8">
+                          {c.sentCount} sent · {c.failedCount} failed · {c.skippedCount} skipped · {c.totalRecipients} total
+                          {' · '}{c.batchSize} every {c.intervalHours}h ({c.timezone})
+                          {c.nextFireAt && c.status !== 'completed' && c.status !== 'cancelled' && (
+                            <> · next fire {new Date(c.nextFireAt).toLocaleString()}</>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
         </main>
       </div>
 
@@ -1342,21 +1521,53 @@ export default function PromoEmailBlast({ onBack }) {
             </span>
           )}
         </div>
-        <button
-          className="peb-btn peb-btn--send"
-          onClick={() => setConfirmOpen(true)}
-          disabled={sending || batchToSend.length === 0}
-          type="button"
-        >
-          🚀 Send to {batchToSend.length} recipient{batchToSend.length === 1 ? '' : 's'}
-          {batchToSend.length < selected.length
-            ? ` (${selected.length - batchToSend.length} deferred)`
-            : ''}
-        </button>
+        {deliveryMode === 'schedule' ? (
+          <button
+            className="peb-btn peb-btn--send"
+            onClick={() => setConfirmOpen(true)}
+            disabled={scheduling || selected.length === 0}
+            type="button"
+          >
+            📅 Schedule {selected.length} recipient{selected.length === 1 ? '' : 's'}
+          </button>
+        ) : (
+          <button
+            className="peb-btn peb-btn--send"
+            onClick={() => setConfirmOpen(true)}
+            disabled={sending || batchToSend.length === 0}
+            type="button"
+          >
+            🚀 Send to {batchToSend.length} recipient{batchToSend.length === 1 ? '' : 's'}
+            {batchToSend.length < selected.length
+              ? ` (${selected.length - batchToSend.length} deferred)`
+              : ''}
+          </button>
+        )}
       </div>
 
       {/* Confirm modal */}
-      {confirmOpen && (
+      {confirmOpen && deliveryMode === 'schedule' && (
+        <div className="peb-overlay" onClick={() => setConfirmOpen(false)}>
+          <div className="peb-modal" onClick={(e) => e.stopPropagation()}>
+            <h3>Confirm schedule</h3>
+            <p>
+              Scheduling <strong>{selected.length}</strong> recipient{selected.length === 1 ? '' : 's'}, sending{' '}
+              <strong>{batchSize}</strong> every <strong>{intervalHours}h</strong>, starting{' '}
+              <strong>{startAt.replace('T', ' ')}</strong> ({timezone}).
+            </p>
+            <p className="peb-muted">Subject: {previewSubject}</p>
+            <p className="peb-warn">
+              Runs on the server from here — still subject to the daily cap, and to unsubscribes
+              recorded at send time.
+            </p>
+            <div className="peb-modal-actions">
+              <button className="peb-btn peb-btn--ghost" onClick={() => setConfirmOpen(false)} type="button">Cancel</button>
+              <button className="peb-btn peb-btn--send" onClick={startSchedule} type="button">Schedule</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {confirmOpen && deliveryMode === 'now' && (
         <div className="peb-overlay" onClick={() => setConfirmOpen(false)}>
           <div className="peb-modal" onClick={(e) => e.stopPropagation()}>
             <h3>Confirm blast</h3>
@@ -1379,6 +1590,27 @@ export default function PromoEmailBlast({ onBack }) {
             <div className="peb-modal-actions">
               <button className="peb-btn peb-btn--ghost" onClick={() => setConfirmOpen(false)} type="button">Cancel</button>
               <button className="peb-btn peb-btn--send" onClick={startSend} type="button">Send now</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Schedule result overlay */}
+      {scheduleResult && (
+        <div className="peb-overlay" onClick={() => setScheduleResult(null)}>
+          <div className="peb-modal" onClick={(e) => e.stopPropagation()}>
+            <h3>{scheduleResult.ok ? 'Campaign scheduled' : 'Could not schedule'}</h3>
+            {scheduleResult.ok ? (
+              <p>
+                "{scheduleResult.campaign.name}" will send {scheduleResult.campaign.batchSize} every{' '}
+                {scheduleResult.campaign.intervalHours}h, first fire{' '}
+                {new Date(scheduleResult.campaign.nextFireAt).toLocaleString()}. See the Campaigns tab for progress.
+              </p>
+            ) : (
+              <p className="peb-warn">{scheduleResult.error}</p>
+            )}
+            <div className="peb-modal-actions">
+              <button className="peb-btn peb-btn--primary" onClick={() => setScheduleResult(null)} type="button">Close</button>
             </div>
           </div>
         </div>
@@ -1514,5 +1746,15 @@ const PEB_STYLES = `
 .peb-progress{height:10px;background:#e5e7eb;border-radius:6px;overflow:hidden;margin:12px 0;}
 .peb-progress-bar{height:100%;background:#4f46e5;transition:width .2s;}
 .peb-errors{max-height:140px;overflow-y:auto;background:#fef2f2;border-radius:8px;padding:10px;font-size:12px;color:#b91c1c;margin:8px 0;}
+.peb-campaign-list{display:flex;flex-direction:column;gap:12px;}
+.peb-campaign-card{border:1px solid #e5e7eb;border-radius:10px;padding:14px 16px;background:#fff;}
+.peb-campaign-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px;}
+.peb-campaign-status{margin-left:8px;font-size:11px;font-weight:700;text-transform:uppercase;padding:2px 8px;border-radius:5px;background:#f3f4f6;color:#6b7280;}
+.peb-campaign-status--running{background:#eef2ff;color:#4f46e5;}
+.peb-campaign-status--scheduled{background:#fffbeb;color:#b45309;}
+.peb-campaign-status--completed{background:#f0fdf4;color:#16a34a;}
+.peb-campaign-status--paused{background:#f3f4f6;color:#6b7280;}
+.peb-campaign-status--cancelled{background:#fef2f2;color:#b91c1c;}
+.peb-campaign-actions{display:flex;gap:6px;flex-shrink:0;}
 @media(max-width:860px){.peb-body{flex-direction:column;}.peb-panel{width:auto;border-right:none;border-bottom:1px solid #e5e7eb;}}
 `;

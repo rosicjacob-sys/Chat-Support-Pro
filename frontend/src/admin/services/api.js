@@ -995,6 +995,35 @@ async applyPromoDomainUpdates({ pairs }) {
   });
 }
 
+// ============ Promo Campaigns (scheduled sends) ============
+
+async createPromoCampaign(payload) {
+  return this.fetch('/api/promo/campaigns', {
+    method: 'POST',
+    body:   JSON.stringify(payload),
+  });
+}
+
+async getPromoCampaigns() {
+  return this.fetch('/api/promo/campaigns');
+}
+
+async getPromoCampaign(id) {
+  return this.fetch(`/api/promo/campaigns/${id}`);
+}
+
+async pausePromoCampaign(id) {
+  return this.fetch(`/api/promo/campaigns/${id}/pause`, { method: 'POST' });
+}
+
+async resumePromoCampaign(id) {
+  return this.fetch(`/api/promo/campaigns/${id}/resume`, { method: 'POST' });
+}
+
+async cancelPromoCampaign(id) {
+  return this.fetch(`/api/promo/campaigns/${id}/cancel`, { method: 'POST' });
+}
+
 // Multipart upload (CSV/XLSX) — can't go through fetch() above, which forces
 // a JSON Content-Type; the browser needs to set its own multipart boundary.
 async uploadPromoRecipients(file) {

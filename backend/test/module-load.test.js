@@ -32,6 +32,7 @@ const MODULES = [
   '../routes/ai-routes',
   '../routes/ai-training-routes',
   '../routes/qa-routes',
+  '../routes/promo-routes',
 ];
 
 let passed = 0;
