@@ -977,6 +977,61 @@ async getPromoSent() {
   return this.fetch('/api/promo/sent');
 }
 
+async getPromoSettings() {
+  return this.fetch('/api/promo/settings');
+}
+
+async updatePromoSettings({ dailyCap }) {
+  return this.fetch('/api/promo/settings', {
+    method: 'PUT',
+    body:   JSON.stringify({ dailyCap }),
+  });
+}
+
+async applyPromoDomainUpdates({ pairs }) {
+  return this.fetch('/api/promo/domain-updates/apply', {
+    method: 'POST',
+    body:   JSON.stringify({ pairs }),
+  });
+}
+
+// Multipart upload (CSV/XLSX) — can't go through fetch() above, which forces
+// a JSON Content-Type; the browser needs to set its own multipart boundary.
+async uploadPromoRecipients(file) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const url = `${this.baseUrl}/api/promo/uploads/parse`;
+    const token = this.getToken();
+    const formData = new FormData();
+    formData.append('file', file);
+
+    xhr.addEventListener('load', () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch (error) {
+          reject(new Error('Failed to parse upload response'));
+        }
+      } else if (xhr.status === 401) {
+        this.handleUnauthorized();
+        reject(new Error('Session expired. Please login again.'));
+      } else {
+        try {
+          const error = JSON.parse(xhr.responseText);
+          reject(new Error(error.message || error.error || 'Upload failed'));
+        } catch (e) {
+          reject(new Error('Upload failed'));
+        }
+      }
+    });
+
+    xhr.addEventListener('error', () => reject(new Error('Network error during upload')));
+    xhr.open('POST', url);
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+    xhr.send(formData);
+  });
+}
+
   // ============ AI Training / Brain ============
 
   async getBrain() {
