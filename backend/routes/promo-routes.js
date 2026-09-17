@@ -9,6 +9,16 @@
 //   POST /api/promo/send                      (admin) → fires blast via Resend
 //   POST /api/promo/record-sent               (admin) → records sent emails to DB
 //   GET  /api/promo/sent                      (admin) → list all sent emails
+//   GET  /api/promo/settings                  (admin) → daily cap status
+//   PUT  /api/promo/settings                  (admin) → change daily cap
+//   POST /api/promo/uploads/parse             (admin) → parse CSV/XLSX audience
+//   POST /api/promo/domain-updates/apply      (admin) → apply stores.shop_domain renames
+//   POST /api/promo/campaigns                 (admin) → create a scheduled campaign
+//   GET  /api/promo/campaigns                 (admin) → list campaigns
+//   GET  /api/promo/campaigns/:id             (admin) → campaign detail + status breakdown
+//   POST /api/promo/campaigns/:id/pause       (admin)
+//   POST /api/promo/campaigns/:id/resume      (admin)
+//   POST /api/promo/campaigns/:id/cancel      (admin)
 //   GET  /api/promo/unsubscribe?e=..&t=..     (public) → one-click opt-out
 
 const express = require('express');
@@ -19,43 +29,21 @@ const router  = express.Router();
 const db      = require('../database');
 const { authenticateToken } = require('../auth');
 
-const FALLBACK_FROM_EMAIL = 'support@pepscustomercare.com';
-const FALLBACK_FROM_NAME  = 'Customer Support';
-const RECIPIENTS_CAP      = 50000;
-const SEND_DELAY_MS       = 200; // delay between individual sends — avoids rate limits
-const DEFAULT_DAILY_CAP   = 100;
-const UPLOAD_ROW_CAP      = 20000;
+const { EMAIL_RE, cleanDomain, applyMerge } = require('../services/promoUtils');
+const promoDb = require('../services/promoDb');
+const { unsubToken, sendPromoEmailToRecipient } = require('../services/promoSend');
+const promoScheduler = require('../services/promoScheduler');
+
+const RECIPIENTS_CAP = 50000;
+const SEND_DELAY_MS  = 200; // delay between individual sends — avoids rate limits
+const UPLOAD_ROW_CAP = 20000;
 
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 10 * 1024 * 1024 },
 });
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
-
-function cleanDomain(d) {
-  return String(d || '').replace(/^https?:\/\//i, '').replace(/\/+$/, '').trim();
-}
-
-function applyMerge(template, fields) {
-  return String(template || '').replace(/\{\{\s*(\w+)\s*\}\}/g, (m, k) => (k in fields ? fields[k] : m));
-}
-
-function unsubToken(email) {
-  return crypto
-    .createHmac('sha256', process.env.JWT_SECRET || 'promo-fallback-secret')
-    .update(String(email).toLowerCase().trim())
-    .digest('hex')
-    .slice(0, 32);
-}
-
-function buildUnsubscribeUrl(email) {
-  const base = (process.env.APP_URL || '').replace(/\/+$/, '');
-  const e    = encodeURIComponent(String(email).toLowerCase().trim());
-  return `${base}/api/promo/unsubscribe?e=${e}&t=${unsubToken(email)}`;
-}
+const { ensurePromoTables, reserveSendSlot, getCapStatus, isUnsubscribed, recordSentEmails } = promoDb;
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -152,123 +140,6 @@ function dedupeUploadRows(rows) {
   return { kept, flagged };
 }
 
-// ── Store email config cache (per domain, reset on each request batch) ────────
-// Fetches the store's own from-address so emails come from the recognised
-// store domain — same pattern as emailService.js which hits inbox reliably.
-
-async function getStoreEmailConfig(storeDomain) {
-  if (!storeDomain) return null;
-  try {
-    const { rows } = await db.pool.query(
-      `SELECT email_from_address, email_from_name, brand_name
-       FROM stores
-       WHERE shop_domain = $1
-       LIMIT 1`,
-      [storeDomain]
-    );
-    return rows[0] || null;
-  } catch (err) {
-    console.error('[Promo] getStoreEmailConfig error:', err.message);
-    return null;
-  }
-}
-
-// ── Table bootstrap ───────────────────────────────────────────────────────────
-
-let _promoTablesReady = null;
-
-async function ensurePromoTables() {
-  if (!_promoTablesReady) {
-    _promoTablesReady = (async () => {
-      await db.pool.query(`
-        CREATE TABLE IF NOT EXISTS promo_unsubscribes (
-          id              SERIAL PRIMARY KEY,
-          email           TEXT NOT NULL UNIQUE,
-          unsubscribed_at TIMESTAMPTZ DEFAULT NOW()
-        )
-      `);
-
-      await db.pool.query(`
-        CREATE TABLE IF NOT EXISTS promo_sent_emails (
-          id            SERIAL PRIMARY KEY,
-          email         TEXT        NOT NULL,
-          store_domain  TEXT        NOT NULL DEFAULT '',
-          store_name    TEXT,
-          discount_code TEXT,
-          sent_at       TIMESTAMPTZ DEFAULT NOW()
-        )
-      `);
-
-      // Drop old global unique if upgrading from earlier version
-      await db.pool.query(`
-        ALTER TABLE promo_sent_emails
-          DROP CONSTRAINT IF EXISTS promo_sent_emails_email_key
-      `).catch(() => {});
-
-      // Composite unique: one send per (email, store_domain)
-      await db.pool.query(`
-        CREATE UNIQUE INDEX IF NOT EXISTS promo_sent_emails_email_store_uidx
-          ON promo_sent_emails (LOWER(email), store_domain)
-      `);
-
-      // Single-row table holding the server-side daily send cap. sent_today /
-      // sent_date back an atomic reserve-a-slot check in reserveSendSlot() so
-      // concurrent admins/campaigns can't both slip past the cap.
-      await db.pool.query(`
-        CREATE TABLE IF NOT EXISTS promo_settings (
-          id         SMALLINT PRIMARY KEY DEFAULT 1,
-          daily_cap  INTEGER NOT NULL DEFAULT ${DEFAULT_DAILY_CAP},
-          sent_today INTEGER NOT NULL DEFAULT 0,
-          sent_date  DATE,
-          CONSTRAINT promo_settings_singleton CHECK (id = 1)
-        )
-      `);
-      await db.pool.query(`
-        INSERT INTO promo_settings (id, daily_cap) VALUES (1, ${DEFAULT_DAILY_CAP})
-        ON CONFLICT (id) DO NOTHING
-      `);
-    })().catch((err) => {
-      _promoTablesReady = null;
-      throw err;
-    });
-  }
-  return _promoTablesReady;
-}
-
-// Atomically reserves one send against today's cap. Returns true if the send
-// may proceed, false if today's cap is already used up. Resets the counter
-// itself the first time it's called on a new day.
-async function reserveSendSlot() {
-  const { rows } = await db.pool.query(`
-    UPDATE promo_settings
-    SET sent_today = CASE WHEN sent_date = CURRENT_DATE THEN sent_today + 1 ELSE 1 END,
-        sent_date  = CURRENT_DATE
-    WHERE id = 1
-      AND (sent_date IS DISTINCT FROM CURRENT_DATE OR sent_today < daily_cap)
-    RETURNING sent_today, daily_cap
-  `);
-  return rows.length > 0;
-}
-
-async function getCapStatus() {
-  const { rows } = await db.pool.query(`
-    SELECT daily_cap AS "dailyCap",
-           CASE WHEN sent_date = CURRENT_DATE THEN sent_today ELSE 0 END AS "sentToday"
-    FROM promo_settings WHERE id = 1
-  `);
-  const row = rows[0] || { dailyCap: DEFAULT_DAILY_CAP, sentToday: 0 };
-  return { dailyCap: row.dailyCap, sentToday: row.sentToday, remainingToday: Math.max(0, row.dailyCap - row.sentToday) };
-}
-
-async function isUnsubscribed(emails) {
-  if (emails.length === 0) return new Set();
-  const { rows } = await db.pool.query(
-    `SELECT LOWER(email) AS email FROM promo_unsubscribes WHERE LOWER(email) = ANY($1)`,
-    [emails.map((e) => e.toLowerCase())]
-  );
-  return new Set(rows.map((r) => r.email));
-}
-
 // ── GET /recipients ───────────────────────────────────────────────────────────
 // Returns purchasers excluding:
 //   - blacklisted conversations
@@ -359,6 +230,7 @@ router.get('/recipients', authenticateToken, async (req, res) => {
 //      treat these as legitimate bulk mail, not spam
 //   4. Adds X-Entity-Ref-ID per email — deduplication hint for mail servers
 //   5. 200ms delay between sends — avoids triggering provider rate limits
+//   6. Server-side daily cap + unsubscribe re-check (see promoDb/promoSend)
 
 router.post('/send', authenticateToken, async (req, res) => {
   try {
@@ -373,15 +245,13 @@ router.post('/send', authenticateToken, async (req, res) => {
     if (!subjectTemplate || !htmlTemplate || !Array.isArray(recipients) || recipients.length === 0)
       return res.status(400).json({ error: 'subjectTemplate, htmlTemplate, and a non-empty recipients array are required' });
 
-    const apiKey = process.env.RESEND_API_KEY;
-    if (!apiKey) return res.status(500).json({ error: 'Email service not configured (missing RESEND_API_KEY)' });
-
     let sent   = 0;
     let failed = 0;
     const errors = [];
 
     // Cache store configs so we don't re-query for every email from the same store
     const storeConfigCache = new Map();
+    const templates = { subjectTemplate, htmlTemplate, textTemplate, fromEmail, fromName };
 
     // Defense in depth: /recipients already excludes unsubscribes for the DB
     // audience, but /send doesn't know where its recipients came from (e.g.
@@ -411,77 +281,9 @@ router.post('/send', authenticateToken, async (req, res) => {
         }
       }
 
-      const domain = cleanDomain(r.storeDomain || r.storeUrl || '');
-
-      // ── Resolve FROM address: prefer store's own domain ──────────────────
-      // This is the key deliverability fix — emails from alconapeptides.ca
-      // come FROM alconapeptides.ca, not a generic shared domain.
-      let resolvedFrom = `${fromName || FALLBACK_FROM_NAME} <${fromEmail || FALLBACK_FROM_EMAIL}>`;
-
-      if (domain) {
-        if (!storeConfigCache.has(domain)) {
-          const config = await getStoreEmailConfig(domain);
-          storeConfigCache.set(domain, config);
-        }
-        const storeConfig = storeConfigCache.get(domain);
-        if (storeConfig) {
-          const storeFromAddress = storeConfig.email_from_address || FALLBACK_FROM_EMAIL;
-          const storeFromName    = storeConfig.email_from_name    || storeConfig.brand_name || r.storeName || FALLBACK_FROM_NAME;
-          resolvedFrom = `${storeFromName} <${storeFromAddress}>`;
-        }
-      }
-
-      const unsubscribeUrl = buildUnsubscribeUrl(email);
-
-      const fields = {
-        customer_email:    email,
-        customer_name:     r.name || email,
-        store_name:        r.storeName || domain || 'our store',
-        store_url:         r.storeUrl || (domain ? `https://${domain}` : ''),
-        store_domain:      domain,
-        // Per-recipient "we've moved" banner, computed client-side from each
-        // row's moved-to domain — empty string for anyone who hasn't moved.
-        moved_banner:      r.movedBanner || '',
-        moved_banner_text: r.movedBannerText || '',
-        unsubscribe_url:   unsubscribeUrl,
-      };
-
-      const msg = {
-        from:    resolvedFrom,
-        to:      [email],
-        subject: applyMerge(subjectTemplate, fields),
-        html:    applyMerge(htmlTemplate,    fields),
-        // ── Deliverability headers ────────────────────────────────────────
-        headers: {
-          // One-click unsubscribe — Gmail/Outlook treat this as legitimate bulk
-          'List-Unsubscribe':      `<${unsubscribeUrl}>`,
-          'List-Unsubscribe-Post': 'List-Unsubscribe=One-Click',
-          // Per-email deduplication hint for receiving mail servers
-          'X-Entity-Ref-ID':       `promo-${Date.now()}-${Buffer.from(email).toString('base64').slice(0, 12)}`,
-        },
-      };
-      if (textTemplate) msg.text = applyMerge(textTemplate, fields);
-
-      // ── Send individually (not batch) ─────────────────────────────────────
-      // /emails/batch is flagged more aggressively by spam filters.
-      // Individual sends via /emails match the pattern that hits inbox.
-      try {
-        const resp = await fetch('https://api.resend.com/emails', {
-          method:  'POST',
-          headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-          body:    JSON.stringify(msg),
-        });
-        const body = await resp.json().catch(() => ({}));
-        if (!resp.ok) {
-          failed++;
-          errors.push(body?.message || `Resend error ${resp.status} for ${email}`);
-        } else {
-          sent++;
-        }
-      } catch (err) {
-        failed++;
-        errors.push(`${err.message || 'Request failed'} (${email})`);
-      }
+      const result = await sendPromoEmailToRecipient(r, templates, storeConfigCache);
+      if (result.ok) sent++;
+      else { failed++; errors.push(result.error); }
 
       // Small delay between sends — avoids triggering Resend rate limits
       // and looks less like a mass blast to receiving mail servers
@@ -507,26 +309,9 @@ router.post('/record-sent', authenticateToken, async (req, res) => {
     if (!Array.isArray(emails) || emails.length === 0)
       return res.status(400).json({ error: 'emails array is required' });
 
-    const values = emails
-      .map((_, i) => `($${i * 4 + 1}, $${i * 4 + 2}, $${i * 4 + 3}, $${i * 4 + 4})`)
-      .join(',');
-
-    const params = emails.flatMap((e) => [
-      String(e.email     || '').toLowerCase().trim(),
-      cleanDomain(e.storeDomain || ''),
-      e.storeName  || '',
-      discountCode || '',
-    ]);
-
-    await db.pool.query(
-      `INSERT INTO promo_sent_emails (email, store_domain, store_name, discount_code)
-       VALUES ${values}
-       ON CONFLICT (LOWER(email), store_domain) DO NOTHING`,
-      params
-    );
-
-    console.log(`[Promo/record-sent] ${emails.length} records by ${req.user.email}`);
-    return res.json({ recorded: emails.length });
+    const { recorded } = await recordSentEmails(emails.map((e) => ({ ...e, discountCode })));
+    console.log(`[Promo/record-sent] ${recorded} records by ${req.user.email}`);
+    return res.json({ recorded });
   } catch (err) {
     console.error('[Promo/record-sent] Error:', err.message);
     return res.status(500).json({ error: err.message });
@@ -628,7 +413,10 @@ router.post('/uploads/parse', authenticateToken, upload.single('file'), async (r
     ]);
 
     const blacklisted  = new Set(blacklistRows.rows.map((r) => r.email));
-    const storeByDomain = new Map(storeRows.rows.map((s) => [cleanDomain(s.shop_domain), s]));
+    // Domains are case-insensitive by definition — match on a lowercased key
+    // so a store saved as "BramptonPeptides.ca" still matches an upload's
+    // "bramptonpeptides.ca" instead of reporting a false "no matching store".
+    const storeByDomain = new Map(storeRows.rows.map((s) => [cleanDomain(s.shop_domain).toLowerCase(), s]));
     const sentPairs      = new Set(sentRows.rows.map((r) => `${r.email}::${r.store_domain}`));
 
     const recipients = [];
@@ -638,7 +426,7 @@ router.post('/uploads/parse', authenticateToken, upload.single('file'), async (r
       const sendDomain = r.newDomain || r.sourceDomain;
       if (sentPairs.has(`${r.email}::${sendDomain}`)) continue;
 
-      const matchedStore = storeByDomain.get(r.sourceDomain) || storeByDomain.get(r.newDomain);
+      const matchedStore = storeByDomain.get(r.sourceDomain.toLowerCase()) || storeByDomain.get(r.newDomain.toLowerCase());
       recipients.push({
         email:         r.email,
         name:          r.name,
@@ -659,7 +447,7 @@ router.post('/uploads/parse', authenticateToken, upload.single('file'), async (r
       if (!r.newDomain) continue;
       const key = `${r.sourceDomain}::${r.newDomain}`;
       if (!pairMap.has(key)) {
-        const matchedStore = storeByDomain.get(r.sourceDomain);
+        const matchedStore = storeByDomain.get(r.sourceDomain.toLowerCase());
         pairMap.set(key, {
           sourceDomain:    r.sourceDomain,
           newDomain:       r.newDomain,
@@ -702,6 +490,15 @@ router.post('/domain-updates/apply', authenticateToken, async (req, res) => {
     const pairs = Array.isArray(req.body?.pairs) ? req.body.pairs : [];
     if (pairs.length === 0) return res.status(400).json({ error: 'pairs array is required' });
 
+    // Resolve the target store the same way /uploads/parse decided it was a
+    // match — a normalized (cleaned + lowercased) comparison in JS — rather
+    // than a raw SQL "WHERE shop_domain = $2" equality check. A raw string
+    // match is fragile against case/protocol/trailing-slash differences in
+    // how the domain happens to be stored, and would silently find zero rows
+    // for every pair even when /uploads/parse just reported a match.
+    const { rows: storeRows } = await db.pool.query(`SELECT id, shop_domain FROM stores`);
+    const storeByDomain = new Map(storeRows.map((s) => [cleanDomain(s.shop_domain).toLowerCase(), s.id]));
+
     let updated = 0;
     const errors = [];
 
@@ -712,16 +509,19 @@ router.post('/domain-updates/apply', authenticateToken, async (req, res) => {
         errors.push({ sourceDomain: p.sourceDomain, newDomain: p.newDomain, error: 'Missing domain' });
         continue;
       }
+
+      const storeId = storeByDomain.get(sourceDomain.toLowerCase());
+      if (!storeId) {
+        errors.push({ sourceDomain, newDomain, error: 'No store found with that domain' });
+        continue;
+      }
+
       try {
-        const { rowCount } = await db.pool.query(
-          `UPDATE stores SET shop_domain = $1, updated_at = NOW() WHERE shop_domain = $2`,
-          [newDomain, sourceDomain]
+        await db.pool.query(
+          `UPDATE stores SET shop_domain = $1, updated_at = NOW() WHERE id = $2`,
+          [newDomain, storeId]
         );
-        if (rowCount === 0) {
-          errors.push({ sourceDomain, newDomain, error: 'No store found with that domain' });
-        } else {
-          updated++;
-        }
+        updated++;
       } catch (err) {
         errors.push({ sourceDomain, newDomain, error: err.message });
       }
@@ -734,6 +534,180 @@ router.post('/domain-updates/apply', authenticateToken, async (req, res) => {
     return res.status(500).json({ error: err.message });
   }
 });
+
+// ── Campaigns (scheduled sends) ────────────────────────────────────────────────
+// "Send batch_size every interval_hours, starting at startAt in timezone."
+// Backed by promoScheduler.js (BullMQ) so a fire happens on its own from the
+// backend — no browser tab needs to stay open between fires.
+
+function serializeCampaign(row) {
+  return {
+    id:              row.id,
+    name:            row.name,
+    status:          row.status,
+    batchSize:       row.batch_size,
+    intervalHours:   Number(row.interval_hours),
+    timezone:        row.timezone,
+    nextFireAt:      row.next_fire_at,
+    totalRecipients: row.total_recipients,
+    sentCount:       row.sent_count,
+    failedCount:     row.failed_count,
+    skippedCount:    row.skipped_count,
+    createdBy:       row.created_by,
+    createdAt:       row.created_at,
+    updatedAt:       row.updated_at,
+  };
+}
+
+router.post('/campaigns', authenticateToken, async (req, res) => {
+  const client = await db.pool.connect();
+  try {
+    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    await ensurePromoTables();
+
+    const {
+      name, recipients, subjectTemplate, htmlTemplate, textTemplate,
+      fromEmail, fromName, batchSize, intervalHours, startAt, timezone,
+    } = req.body || {};
+
+    if (!subjectTemplate || !htmlTemplate || !Array.isArray(recipients) || recipients.length === 0)
+      return res.status(400).json({ error: 'subjectTemplate, htmlTemplate, and a non-empty recipients array are required' });
+
+    const batch    = Number(batchSize);
+    const interval = Number(intervalHours);
+    if (!Number.isFinite(batch) || batch < 1) return res.status(400).json({ error: 'batchSize must be 1 or more' });
+    if (!Number.isFinite(interval) || interval <= 0) return res.status(400).json({ error: 'intervalHours must be greater than 0' });
+
+    let nextFireAt;
+    try {
+      nextFireAt = promoScheduler.localToUtc(startAt, timezone || 'UTC');
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+    // A start time already in the past just means "start right away" rather
+    // than an error — the admin picking "now" in the UI shouldn't fail here.
+    if (nextFireAt.getTime() < Date.now()) nextFireAt = new Date();
+
+    await client.query('BEGIN');
+
+    const { rows: campaignRows } = await client.query(
+      `INSERT INTO promo_campaigns
+         (name, status, from_email, from_name, subject_template, html_template, text_template,
+          batch_size, interval_hours, timezone, next_fire_at, total_recipients, created_by)
+       VALUES ($1, 'scheduled', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       RETURNING *`,
+      [
+        name || 'Promo campaign', fromEmail || null, fromName || null,
+        subjectTemplate, htmlTemplate, textTemplate || null,
+        Math.floor(batch), interval, timezone || 'UTC', nextFireAt, recipients.length, req.user.email,
+      ]
+    );
+    const campaign = campaignRows[0];
+
+    const values = recipients
+      .map((_, i) => `($${i * 9 + 1}, $${i * 9 + 2}, $${i * 9 + 3}, $${i * 9 + 4}, $${i * 9 + 5}, $${i * 9 + 6}, $${i * 9 + 7}, $${i * 9 + 8}, $${i * 9 + 9})`)
+      .join(',');
+    const params = recipients.flatMap((r) => [
+      campaign.id,
+      String(r.email || '').trim().toLowerCase(),
+      r.name || '',
+      r.storeId ?? null,
+      r.storeName || '',
+      r.storeDomain || '',
+      r.storeUrl || '',
+      r.movedBanner || '',
+      r.movedBannerText || '',
+    ]);
+    await client.query(
+      `INSERT INTO promo_campaign_recipients
+         (campaign_id, email, name, store_id, store_name, store_domain, store_url, moved_banner, moved_banner_text)
+       VALUES ${values}`,
+      params
+    );
+
+    await client.query('COMMIT');
+
+    await promoScheduler.scheduleCampaignFire(campaign.id, nextFireAt);
+
+    console.log(`[Promo/campaigns] Created #${campaign.id} "${campaign.name}" by ${req.user.email}: ${recipients.length} recipients, next fire ${nextFireAt.toISOString()}`);
+    return res.json(serializeCampaign(campaign));
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[Promo/campaigns] Create error:', err.message);
+    return res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+router.get('/campaigns', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    await ensurePromoTables();
+    const { rows } = await db.pool.query(`SELECT * FROM promo_campaigns ORDER BY created_at DESC LIMIT 100`);
+    return res.json(rows.map(serializeCampaign));
+  } catch (err) {
+    console.error('[Promo/campaigns] List error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/campaigns/:id', authenticateToken, async (req, res) => {
+  try {
+    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    await ensurePromoTables();
+
+    const { rows } = await db.pool.query(`SELECT * FROM promo_campaigns WHERE id = $1`, [req.params.id]);
+    if (rows.length === 0) return res.status(404).json({ error: 'Campaign not found' });
+
+    const { rows: statusRows } = await db.pool.query(
+      `SELECT status, COUNT(*)::int AS n FROM promo_campaign_recipients WHERE campaign_id = $1 GROUP BY status`,
+      [req.params.id]
+    );
+    const statusBreakdown = { pending: 0, sent: 0, failed: 0, skipped: 0 };
+    for (const r of statusRows) statusBreakdown[r.status] = r.n;
+
+    return res.json({ ...serializeCampaign(rows[0]), statusBreakdown });
+  } catch (err) {
+    console.error('[Promo/campaigns] Detail error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+async function setCampaignStatus(req, res, { from, to, reschedule }) {
+  try {
+    if (req.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
+    await ensurePromoTables();
+
+    const { rows } = await db.pool.query(
+      `UPDATE promo_campaigns SET status = $2, updated_at = NOW() WHERE id = $1 AND status = ANY($3) RETURNING *`,
+      [req.params.id, to, from]
+    );
+    if (rows.length === 0) return res.status(409).json({ error: `Campaign is not in a state that can be moved to "${to}"` });
+
+    if (reschedule) {
+      const nextFireAt = new Date();
+      await db.pool.query(`UPDATE promo_campaigns SET next_fire_at = $2 WHERE id = $1`, [req.params.id, nextFireAt]);
+      await promoScheduler.scheduleCampaignFire(rows[0].id, nextFireAt);
+    } else {
+      await promoScheduler.removeCampaignJob(rows[0].id);
+    }
+
+    return res.json(serializeCampaign(rows[0]));
+  } catch (err) {
+    console.error('[Promo/campaigns] Status change error:', err.message);
+    return res.status(500).json({ error: err.message });
+  }
+}
+
+router.post('/campaigns/:id/pause', authenticateToken, (req, res) =>
+  setCampaignStatus(req, res, { from: ['scheduled', 'running'], to: 'paused', reschedule: false }));
+
+router.post('/campaigns/:id/resume', authenticateToken, (req, res) =>
+  setCampaignStatus(req, res, { from: ['paused'], to: 'scheduled', reschedule: true }));
+
+router.post('/campaigns/:id/cancel', authenticateToken, (req, res) =>
+  setCampaignStatus(req, res, { from: ['scheduled', 'running', 'paused'], to: 'cancelled', reschedule: false }));
 
 // ── GET /unsubscribe ──────────────────────────────────────────────────────────
 
