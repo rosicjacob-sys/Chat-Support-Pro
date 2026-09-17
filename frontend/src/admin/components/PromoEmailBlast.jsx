@@ -1101,11 +1101,21 @@ export default function PromoEmailBlast({ onBack }) {
                 {applyingDomains ? 'Applying…' : `Apply ${checkedPairs.size} domain update${checkedPairs.size === 1 ? '' : 's'}`}
               </button>
               {domainApplyResult && (
-                <div className={`peb-muted peb-mt8 ${domainApplyResult.error ? 'peb-warn' : ''}`}>
-                  {domainApplyResult.error
-                    ? domainApplyResult.error
-                    : `${domainApplyResult.updated || 0} updated, ${(domainApplyResult.errors || []).length} failed.`}
-                </div>
+                <>
+                  <div className={`peb-muted peb-mt8 ${domainApplyResult.error ? 'peb-warn' : ''}`}>
+                    {domainApplyResult.error
+                      ? domainApplyResult.error
+                      : `${domainApplyResult.updated || 0} updated, ${(domainApplyResult.errors || []).length} failed.`}
+                  </div>
+                  {domainApplyResult.errors?.length > 0 && (
+                    <div className="peb-errors">
+                      {domainApplyResult.errors.slice(0, 10).map((e, i) => (
+                        <div key={i}>{e.sourceDomain} → {e.newDomain}: {e.error}</div>
+                      ))}
+                      {domainApplyResult.errors.length > 10 && <div>…and {domainApplyResult.errors.length - 10} more</div>}
+                    </div>
+                  )}
+                </>
               )}
             </div>
           )}

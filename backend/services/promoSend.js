@@ -27,17 +27,21 @@ function buildUnsubscribeUrl(email) {
 
 // Fetches the store's own from-address so emails come from the recognised
 // store domain — same pattern as emailService.js which hits inbox reliably.
+//
+// Matches in JS on a cleaned + lowercased domain rather than a raw SQL
+// "WHERE shop_domain = $1" equality check: a raw string match is fragile
+// against a stored domain that has a protocol prefix, trailing slash, or
+// different case than the caller's value, and would silently return no
+// config (falling back to the generic from-address) instead of the store's
+// own — see the same class of bug fixed in POST /domain-updates/apply.
 async function getStoreEmailConfig(storeDomain) {
   if (!storeDomain) return null;
   try {
+    const target = cleanDomain(storeDomain).toLowerCase();
     const { rows } = await db.pool.query(
-      `SELECT email_from_address, email_from_name, brand_name
-       FROM stores
-       WHERE shop_domain = $1
-       LIMIT 1`,
-      [storeDomain]
+      `SELECT shop_domain, email_from_address, email_from_name, brand_name FROM stores`
     );
-    return rows[0] || null;
+    return rows.find((r) => cleanDomain(r.shop_domain).toLowerCase() === target) || null;
   } catch (err) {
     console.error('[Promo] getStoreEmailConfig error:', err.message);
     return null;

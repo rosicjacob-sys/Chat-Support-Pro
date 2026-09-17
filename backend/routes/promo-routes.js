@@ -413,7 +413,10 @@ router.post('/uploads/parse', authenticateToken, upload.single('file'), async (r
     ]);
 
     const blacklisted  = new Set(blacklistRows.rows.map((r) => r.email));
-    const storeByDomain = new Map(storeRows.rows.map((s) => [cleanDomain(s.shop_domain), s]));
+    // Domains are case-insensitive by definition — match on a lowercased key
+    // so a store saved as "BramptonPeptides.ca" still matches an upload's
+    // "bramptonpeptides.ca" instead of reporting a false "no matching store".
+    const storeByDomain = new Map(storeRows.rows.map((s) => [cleanDomain(s.shop_domain).toLowerCase(), s]));
     const sentPairs      = new Set(sentRows.rows.map((r) => `${r.email}::${r.store_domain}`));
 
     const recipients = [];
@@ -423,7 +426,7 @@ router.post('/uploads/parse', authenticateToken, upload.single('file'), async (r
       const sendDomain = r.newDomain || r.sourceDomain;
       if (sentPairs.has(`${r.email}::${sendDomain}`)) continue;
 
-      const matchedStore = storeByDomain.get(r.sourceDomain) || storeByDomain.get(r.newDomain);
+      const matchedStore = storeByDomain.get(r.sourceDomain.toLowerCase()) || storeByDomain.get(r.newDomain.toLowerCase());
       recipients.push({
         email:         r.email,
         name:          r.name,
@@ -444,7 +447,7 @@ router.post('/uploads/parse', authenticateToken, upload.single('file'), async (r
       if (!r.newDomain) continue;
       const key = `${r.sourceDomain}::${r.newDomain}`;
       if (!pairMap.has(key)) {
-        const matchedStore = storeByDomain.get(r.sourceDomain);
+        const matchedStore = storeByDomain.get(r.sourceDomain.toLowerCase());
         pairMap.set(key, {
           sourceDomain:    r.sourceDomain,
           newDomain:       r.newDomain,
@@ -487,6 +490,15 @@ router.post('/domain-updates/apply', authenticateToken, async (req, res) => {
     const pairs = Array.isArray(req.body?.pairs) ? req.body.pairs : [];
     if (pairs.length === 0) return res.status(400).json({ error: 'pairs array is required' });
 
+    // Resolve the target store the same way /uploads/parse decided it was a
+    // match — a normalized (cleaned + lowercased) comparison in JS — rather
+    // than a raw SQL "WHERE shop_domain = $2" equality check. A raw string
+    // match is fragile against case/protocol/trailing-slash differences in
+    // how the domain happens to be stored, and would silently find zero rows
+    // for every pair even when /uploads/parse just reported a match.
+    const { rows: storeRows } = await db.pool.query(`SELECT id, shop_domain FROM stores`);
+    const storeByDomain = new Map(storeRows.map((s) => [cleanDomain(s.shop_domain).toLowerCase(), s.id]));
+
     let updated = 0;
     const errors = [];
 
@@ -497,16 +509,19 @@ router.post('/domain-updates/apply', authenticateToken, async (req, res) => {
         errors.push({ sourceDomain: p.sourceDomain, newDomain: p.newDomain, error: 'Missing domain' });
         continue;
       }
+
+      const storeId = storeByDomain.get(sourceDomain.toLowerCase());
+      if (!storeId) {
+        errors.push({ sourceDomain, newDomain, error: 'No store found with that domain' });
+        continue;
+      }
+
       try {
-        const { rowCount } = await db.pool.query(
-          `UPDATE stores SET shop_domain = $1, updated_at = NOW() WHERE shop_domain = $2`,
-          [newDomain, sourceDomain]
+        await db.pool.query(
+          `UPDATE stores SET shop_domain = $1, updated_at = NOW() WHERE id = $2`,
+          [newDomain, storeId]
         );
-        if (rowCount === 0) {
-          errors.push({ sourceDomain, newDomain, error: 'No store found with that domain' });
-        } else {
-          updated++;
-        }
+        updated++;
       } catch (err) {
         errors.push({ sourceDomain, newDomain, error: err.message });
       }
