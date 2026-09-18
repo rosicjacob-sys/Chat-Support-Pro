@@ -175,16 +175,6 @@ const DEFAULT_BODY =
     </td>
   </tr>
 
-  <!-- Closing -->
-  <tr>
-    <td class="pad-lg" style="padding:24px 32px 32px 32px;">
-      <p style="margin:0; color:#2d3a34; font-size:16px; line-height:1.65;">
-        Let's go,<br>
-        <strong>The {{store_name}} Team</strong>
-      </p>
-    </td>
-  </tr>
-
   <!-- Footer -->
   <tr>
     <td class="pad-lg" style="background-color:#f7f8f9; padding:22px 32px; text-align:center; border-top:1px solid #e6e9e8;">
